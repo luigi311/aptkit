@@ -50,6 +50,8 @@ import time
 import uuid
 
 from gi.repository import GObject, GLib
+import apt
+import apt_pkg
 import dbus.exceptions
 import dbus.service
 import dbus.mainloop.glib
@@ -1406,6 +1408,10 @@ class AptKit(DBusObject):
         os.nice(5)
         self.options = options
         self.packagekit = None
+        # Read-only apt cache for GetPackagesInfo, opened lazily and
+        # reopened when the dpkg status or the package lists change
+        self._query_cache = None
+        self._query_cache_stamp = None
         if connect is True:
             if bus is None:
                 bus = dbus.SystemBus()
@@ -1893,6 +1899,71 @@ class AptKit(DBusObject):
         else:
             current = ""
         return current, queued
+
+    def _get_query_cache(self):
+        """Return an apt.Cache for read-only queries, reopening it when
+        the dpkg status file or the package lists have changed.
+        """
+        stamps = []
+        for path in (apt_pkg.config.find_file("Dir::State::status"),
+                     apt_pkg.config.find_dir("Dir::State::lists")):
+            try:
+                stamps.append(os.stat(path).st_mtime)
+            except OSError:
+                stamps.append(0)
+        stamps = tuple(stamps)
+        if self._query_cache is None:
+            self._query_cache = apt.Cache()
+            self._query_cache_stamp = stamps
+        elif stamps != self._query_cache_stamp:
+            self._query_cache.open()
+            self._query_cache_stamp = stamps
+        return self._query_cache
+
+    # pylint: disable-msg=C0103,C0322
+    @dbus.service.method(APTKIT_DBUS_INTERFACE,
+                         in_signature="as", out_signature="a(sbbsstt)")
+    def GetPackagesInfo(self, package_names):
+        """Return installation state information for the given packages.
+
+        This is a read-only query: it does not create a transaction and
+        requires no authorization.
+
+        :param package_names: The names of the packages.
+
+        :returns: An array of structs, one per requested name:
+            (name, known, installed, installed_version,
+             candidate_version, download_size, installed_size).
+            Unknown packages are returned with known set to False.
+        """
+        log.debug("GetPackagesInfo() was called: %s" % package_names)
+        cache = self._get_query_cache()
+        infos = []
+        for name in package_names:
+            name = str(name)
+            try:
+                pkg = cache[name]
+            except KeyError:
+                infos.append((name, False, False, "", "", 0, 0))
+                continue
+            installed = pkg.installed
+            candidate = pkg.candidate
+            if installed is not None:
+                installed_size = installed.installed_size
+            elif candidate is not None:
+                installed_size = candidate.installed_size
+            else:
+                installed_size = 0
+            infos.append((
+                name,
+                True,
+                pkg.is_installed,
+                installed.version if installed is not None else "",
+                candidate.version if candidate is not None else "",
+                candidate.size if candidate is not None else 0,
+                installed_size,
+            ))
+        return infos
 
     # pylint: disable-msg=C0103,C0322
     @dbus.service.method(APTKIT_DBUS_INTERFACE,
