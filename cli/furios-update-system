@@ -40,7 +40,6 @@ RUN_WAIT_TIMEOUT_SECONDS = 7200
 PROGRESS_REFRESH_INTERVAL_SECONDS = 1
 
 ERROR_CACHE_BROKEN = "error-cache-broken"
-TRANSACTION_FAILED_ERROR_NAME = "org.aptkit.TransactionFailed"
 
 last_progress = None
 last_status = None
@@ -53,29 +52,6 @@ class AptkitError(Exception):
     def __init__(self, message, code=None):
         super().__init__(message)
         self.code = code
-
-
-def get_transaction_error_code(message):
-    """Extract Aptkit's stable error code from a GDBus error message.
-
-    Gio normally formats a remote transaction failure as:
-
-        GDBus.Error:org.aptkit.TransactionFailed: error-cache-broken: details
-
-    Some callers may provide the message without the ``GDBus.Error:`` prefix.
-    Match either form and capture only the lowercase ``error-*`` code, stopping
-    at the colon, whitespace, or end of the message before the human-readable
-    details begin.
-    """
-    match = re.search(
-        rf"(?:GDBus\.Error:)?{re.escape(TRANSACTION_FAILED_ERROR_NAME)}:"
-        r"\s*(error-[a-z0-9-]+)(?::|\s|$)",
-        message,
-    )
-    if match is None:
-        return None
-
-    return match.group(1)
 
 
 def make_transaction_result(exit_state, packages=None, dependencies=None):
@@ -644,10 +620,46 @@ def run_transaction_once(transaction_path, simulate, show_updates):
                 None,
             )
         except GLib.Error as exc:
+            error_code = None
+            error_details = exc.message
+
+            try:
+                error_result = transaction_proxy.get_connection().call_sync(
+                    APTKIT_BUS_NAME,
+                    transaction_path,
+                    "org.freedesktop.DBus.Properties",
+                    "Get",
+                    GLib.Variant(
+                        "(ss)",
+                        (APTKIT_TRANSACTION_INTERFACE, "Error"),
+                    ),
+                    GLib.VariantType.new("(v)"),
+                    Gio.DBusCallFlags.NONE,
+                    DBUS_CALL_TIMEOUT_MS,
+                    None,
+                )
+                error_variant = unwrap_variant(
+                    error_result.get_child_value(0)
+                )
+                error_value = error_variant.unpack()
+
+                if (
+                    isinstance(error_value, (tuple, list))
+                    and len(error_value) == 2
+                ):
+                    if isinstance(error_value[0], str) and error_value[0]:
+                        error_code = error_value[0]
+                    if isinstance(error_value[1], str) and error_value[1]:
+                        error_details = error_value[1]
+            except Exception:
+                # Preserve the original GDBus error if the transaction has
+                # disappeared or its structured Error property is unavailable.
+                pass
+
             raise AptkitError(
                 f"{method} on transaction {transaction_path} failed: "
-                f"{exc.message}",
-                code=get_transaction_error_code(exc.message),
+                f"{error_details}",
+                code=error_code,
             ) from exc
 
         refresh_initial_properties()
